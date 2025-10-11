@@ -15,23 +15,15 @@ def read_gray(path: Path):
         raise RuntimeError(f"Failed to read {path}")
     return img
 
-# ---------- NEW: small helpers ----------
+# ---------- light pre-processing ----------
 def apply_clahe(gray):
+    
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray)
 
-def inlier_subset(matches, mask):
-    if mask is None:
-        return matches
-    keep = mask.ravel().tolist()
-    return [m for m, k in zip(matches, keep) if k]
-
-def verdict_from_inliers(inliers, good, min_inliers=15, min_ratio=0.30):
-    if good == 0:
-        return "NO MATCH"
-    ratio = inliers / float(good)
-    return "MATCH" if (inliers >= min_inliers and ratio >= min_ratio) else "NO MATCH"
-# ----------------------------------------
+# ---------- tutorial-style helpers ----------
+def verdict_from_good(good_count, threshold):
+    return "MATCH" if good_count >= threshold else "NO MATCH"
 
 def ratio_filter(knn_matches, ratio):
     good = []
@@ -43,37 +35,26 @@ def ratio_filter(knn_matches, ratio):
             good.append(m)
     return good
 
-def find_homography(kp1, kp2, matches, reproj_thresh=3.0):
-    if len(matches) < 4:
-        return None, None
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
-    H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, reproj_thresh)
-    return H, mask
-
-def draw_and_save(img1, img2, kp1, kp2, matches, H, out_path: Path, title: str, max_lines=50):
-    # Sort matches and keep a few for visualization
+def draw_and_save(img1, img2, kp1, kp2, matches, out_path: Path, title: str, max_lines=50):
     matches = sorted(matches, key=lambda m: m.distance)[:max_lines]
     vis = cv2.drawMatches(
         img1, kp1, img2, kp2, matches, None,
         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
     )
-    # If we have a homography, draw the projected box of img1 onto img2
-    if H is not None:
-        h, w = img1.shape[:2]
-        box = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
-        try:
-            dst = cv2.perspectiveTransform(box, H)
-            # drawMatches puts img2 to the RIGHT of img1; shift polygon accordingly
-            dst[:,0,0] += img1.shape[1]
-            cv2.polylines(vis, [np.int32(dst)], True, (255,255,255), 3)
-        except cv2.error:
-            pass
-    # Small title overlay
-    cv2.putText(vis, title, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+    # Readable title (black background)
+    Himg, Wimg = vis.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.7, Wimg / 1600.0)
+    thick = max(2, int(Wimg / 900))
+    (tw, th), _ = cv2.getTextSize(title, font, scale, thick)
+    pad = 10
+    cv2.rectangle(vis, (10, 10), (10 + tw + 2*pad, 10 + th + 2*pad), (0,0,0), -1)
+    cv2.putText(vis, title, (10 + pad, 10 + th + pad), font, scale, (255,255,255), thick, cv2.LINE_AA)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), vis)
 
+# ---------- pipelines ----------
 def sift_flann(img1, img2):
     sift = cv2.SIFT_create()
     FLANN_INDEX_KDTREE = 1
@@ -105,50 +86,94 @@ def orb_bf(img1, img2):
     t1 = time.perf_counter()
     return len(good), (t1 - t0)*1000, k1, k2, good
 
-def run_on_folder(folder: Path, label: str, vis_dir: Path, limit_pairs: int = 0, max_lines=50):
+# ---------- dataset runners ----------
+def run_fingerprint_sets(root: Path, vis_dir: Path, max_lines=50,
+                         sift_thresh=30, orb_thresh=20):
+    """
+    Process fingerprint dataset where each immediate subfolder contains a pair:
+      root/
+        same_1/ (two images)
+        different_1/ (two images)
+        ...
+    Decision is based purely on *good* match counts.
+    """
+    if not root.exists():
+        print(f"[FINGERPRINTS] Folder not found: {root}")
+        return
+
+    subdirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if not subdirs:
+        print(f"[FINGERPRINTS] No subfolders in {root}")
+        return
+
+    print(f"\nFINGERPRINTS: {root}  (processing {len(subdirs)} sets)")
+    for sd in subdirs:
+        imgs = sorted(list_images(sd))
+        if len(imgs) < 2:
+            print(f"- {sd.name}: needs at least 2 images, found {len(imgs)} — skipping")
+            continue
+
+        a, b = imgs[0], imgs[1]
+        img1 = apply_clahe(read_gray(a))
+        img2 = apply_clahe(read_gray(b))
+
+        # SIFT + FLANN
+        s_good_count, s_ms, s_k1, s_k2, s_good = sift_flann(img1, img2)
+        s_verdict = verdict_from_good(s_good_count, sift_thresh)
+
+        # ORB + BF
+        o_good_count, o_ms, o_k1, o_k2, o_good = orb_bf(img1, img2)
+        o_verdict = verdict_from_good(o_good_count, orb_thresh)
+
+        print(f"- {sd.name}: {a.name} vs {b.name}")
+        print(f"  SIFT+FLANN -> good:{s_good_count:4d}, time:{s_ms:7.1f} ms, {s_verdict}")
+        print(f"  ORB+BF    -> good:{o_good_count:4d}, time:{o_ms:7.1f} ms, {o_verdict}")
+
+        # visuals (lines only; no homography box)
+        out_sift = vis_dir / f"FINGERPRINTS_{sd.name}_SIFT_{a.stem}_VS_{b.stem}.jpg"
+        draw_and_save(img1, img2, s_k1, s_k2, s_good, out_sift,
+                      f"SIFT+FLANN  good={s_good_count}  ({s_verdict})", max_lines=max_lines)
+
+        out_orb  = vis_dir / f"FINGERPRINTS_{sd.name}_ORB_{a.stem}_VS_{b.stem}.jpg"
+        draw_and_save(img1, img2, o_k1, o_k2, o_good, out_orb,
+                      f"ORB+BF      good={o_good_count}  ({o_verdict})", max_lines=max_lines)
+
+def run_on_folder(folder: Path, label: str, vis_dir: Path, limit_pairs: int = 0,
+                  max_lines=50, sift_thresh=80, orb_thresh=25):
+    """
+    Generic folder runner (compares all pairs).
+    """
     files = list_images(folder)
     files.sort()
     if len(files) < 2:
         print(f"[{label}] Need at least two images in {folder}")
         return
-    print(f"\n=== {label}: {folder} ===")
+    print(f"\n{label}: {folder}")
     count = 0
     for i in range(len(files)):
         for j in range(i+1, len(files)):
             a, b = files[i], files[j]
-            # --- NEW: CLAHE pre-processing ---
+
             img1 = apply_clahe(read_gray(a))
             img2 = apply_clahe(read_gray(b))
 
-            sift_good, sift_ms, s_k1, s_k2, s_good = sift_flann(img1, img2)
-            orb_good,  orb_ms,  o_k1, o_k2, o_good  = orb_bf(img1, img2)
+            s_good_count, s_ms, s_k1, s_k2, s_good = sift_flann(img1, img2)
+            o_good_count, o_ms, o_k1, o_k2, o_good = orb_bf(img1, img2)
 
-            # --- Compute homographies and inliers ---
-            H_sift, mask_s = find_homography(s_k1, s_k2, s_good)
-            H_orb,  mask_o = find_homography(o_k1, o_k2, o_good)
-
-            s_inliers = inlier_subset(s_good, mask_s)
-            o_inliers = inlier_subset(o_good, mask_o)
-
-            s_verdict = verdict_from_inliers(len(s_inliers), len(s_good), min_inliers=15, min_ratio=0.30)
-            o_verdict = verdict_from_inliers(len(o_inliers), len(o_good),  min_inliers=15, min_ratio=0.30)
+            s_verdict = verdict_from_good(s_good_count, sift_thresh)
+            o_verdict = verdict_from_good(o_good_count, orb_thresh)
 
             print(f"- Pair: {a.name} vs {b.name}")
-            print(f"  SIFT+FLANN -> good: {len(s_good):4d}, inliers: {len(s_inliers):4d}, time: {sift_ms:7.1f} ms, {s_verdict}")
-            print(f"  ORB+BF    -> good: {len(o_good):4d}, inliers: {len(o_inliers):4d}, time: {orb_ms:7.1f} ms, {o_verdict}")
+            print(f"  SIFT+FLANN -> good: {s_good_count:4d}, time: {s_ms:7.1f} ms, {s_verdict}")
+            print(f"  ORB+BF    -> good: {o_good_count:4d}, time: {o_ms:7.1f} ms, {o_verdict}")
 
-            # --- Draw ONLY INLIERS (clean visuals) ---
             out_sift = vis_dir / f"{label}_SIFT_{a.stem}_VS_{b.stem}.jpg"
-            draw_and_save(
-                img1, img2, s_k1, s_k2, s_inliers, H_sift, out_sift,
-                f"SIFT+FLANN  inliers={len(s_inliers)}  ({s_verdict})", max_lines=max_lines
-            )
+            draw_and_save(img1, img2, s_k1, s_k2, s_good, out_sift,
+                          f"SIFT+FLANN  good={s_good_count}  ({s_verdict})", max_lines=max_lines)
 
             out_orb = vis_dir / f"{label}_ORB_{a.stem}_VS_{b.stem}.jpg"
-            draw_and_save(
-                img1, img2, o_k1, o_k2, o_inliers, H_orb, out_orb,
-                f"ORB+BF      inliers={len(o_inliers)}  ({o_verdict})", max_lines=max_lines
-            )
+            draw_and_save(img1, img2, o_k1, o_k2, o_good, out_orb,
+                          f"ORB+BF      good={o_good_count}  ({o_verdict})", max_lines=max_lines)
 
             count += 1
             if limit_pairs and count >= limit_pairs:
@@ -156,18 +181,28 @@ def run_on_folder(folder: Path, label: str, vis_dir: Path, limit_pairs: int = 0,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fingerprints", required=True, help="e.g. ./dataset_folder/data_check")
+    ap.add_argument("--fingerprints", required=True, help="e.g. ./dataset_folder")
     ap.add_argument("--school", required=True, help="e.g. ./uia_images")
     ap.add_argument("--limit_pairs", type=int, default=0, help="stop after N pairs per folder")
     ap.add_argument("--vis_dir", default="vis", help="folder to save visualizations")
     ap.add_argument("--max_lines", type=int, default=50, help="max match lines to draw per image")
+
+    # thresholds (tweak if your counts differ)
+    ap.add_argument("--sift_thresh_fp", type=int, default=30, help="good-match cutoff for SIFT on fingerprints")
+    ap.add_argument("--orb_thresh_fp",  type=int, default=20, help="good-match cutoff for ORB on fingerprints")
+    ap.add_argument("--sift_thresh_sc", type=int, default=80, help="good-match cutoff for SIFT on school images")
+    ap.add_argument("--orb_thresh_sc",  type=int, default=25, help="good-match cutoff for ORB on school images")
     args = ap.parse_args()
 
-    vis_dir = Path(args.vis_dir)
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    vis_dir = Path(args.vis_dir); vis_dir.mkdir(parents=True, exist_ok=True)
 
-    run_on_folder(Path(args.fingerprints), "FINGERPRINTS", vis_dir, args.limit_pairs, args.max_lines)
-    run_on_folder(Path(args.school), "SCHOOL", vis_dir, args.limit_pairs, args.max_lines)
+    # Fingerprints: each subfolder is one pair
+    run_fingerprint_sets(Path(args.fingerprints), vis_dir, args.max_lines,
+                         sift_thresh=args.sift_thresh_fp, orb_thresh=args.orb_thresh_fp)
+
+    # School: all pairs in the given folder
+    run_on_folder(Path(args.school), "SCHOOL", vis_dir, args.limit_pairs, args.max_lines,
+                  sift_thresh=args.sift_thresh_sc, orb_thresh=args.orb_thresh_sc)
 
 if __name__ == "__main__":
     main()
