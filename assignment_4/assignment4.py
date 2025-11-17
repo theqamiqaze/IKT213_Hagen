@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import os
 
+# I originally tried SIFT/FLANN, but the output was bad, and ORB, despite being unstable, worked better.
+# Though ORB isn't perfect either.
 
 def harris_corner_detection(reference_image: np.ndarray) -> np.ndarray:
     # Detect and mark corners using Harris corner detector.
